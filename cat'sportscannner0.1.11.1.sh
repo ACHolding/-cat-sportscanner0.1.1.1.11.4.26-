@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cats-portscan 0.2.1 - TCP connect scanner
+# cats-portscan 0.2.2 - TCP connect scanner
 #
 # Scan only systems you own or have explicit written authorization to test.
 #
@@ -19,7 +19,7 @@ fi
 
 set -uo pipefail
 
-readonly VERSION=0.2.1
+readonly VERSION=0.2.2
 readonly PROG=${0##*/}
 readonly DEFAULT_PORTS='21,22,23,25,53,80,110,111,135,139,143,389,443,445,587,993,995,1433,1521,2049,3306,3389,5432,5900,6379,8080,8443,9200,27017'
 readonly BANNER_MAX=200
@@ -160,13 +160,14 @@ expand_ports() {
 
 # One pass over /etc/services, cached in memory. getent is glibc-only, so it is
 # useless on macOS; this reads the file directly instead of forking per port.
+# The protocol suffix lives on the port field, not in its own column.
 load_etc_services() {
-  local name port proto _rest
+  local name port _comment
   [[ -r /etc/services ]] || return 0
-  while read -r name port proto _rest; do
+  while read -r name port _comment; do
     [[ -n $name && -n $port ]] || continue
     [[ $name == \#* ]] && continue
-    [[ $proto == tcp ]] || continue
+    [[ $port == */tcp ]] || continue
     port=${port%/tcp}
     [[ $port =~ ^[0-9]+$ ]] || continue
     [[ -n ${SERVICE[$port]:-} || -n ${ETC_SERVICES[$port]:-} ]] && continue
@@ -369,6 +370,7 @@ parse_args() {
 
 check_deps() {
   local c tool
+  [[ $MAX_PROBES =~ ^[1-9][0-9]*$ ]] || fail "MAX_PROBES must be a positive integer (got: $MAX_PROBES)"
   for c in timeout gtimeout; do
     if command -v "$c" >/dev/null 2>&1; then TIMEOUT_BIN=$c; break; fi
   done
