@@ -1,26 +1,29 @@
 #!/usr/bin/env bash
-# Re-run under bash if started with sh/dash (macOS /bin/sh is not bash 4+).
-if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
-# cats-portscan 0.2.0 - TCP connect scanner
+# cats-portscan 0.2.1 - TCP connect scanner
 #
 # Scan only systems you own or have explicit written authorization to test.
 #
 # Exit status: 0 scan completed, 1 runtime error, 2 usage error, 130/143 interrupted.
 # Results go to stdout. Progress and the summary go to stderr, so output pipes cleanly.
 
-# Bash 4.3+ is needed for associative arrays, mapfile, and `wait -n`.
-if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 3) )); then
-  printf 'error: bash 4.3 or newer required (found %s; macOS: brew install bash)\n' "$BASH_VERSION" >&2
+# Re-exec under bash 4.3+ if started with sh/dash, or with an older bash.
+bash_ok() { "$1" -c '(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) ))' 2>/dev/null; }
+if [ -z "${BASH_VERSION:-}" ] || ! bash_ok "${BASH:-bash}"; then
+  for cand in /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash bash; do
+    command -v "$cand" >/dev/null 2>&1 || continue
+    if bash_ok "$cand"; then exec "$cand" "$0" "$@"; fi
+  done
+  printf 'error: bash 4.3 or newer required (macOS: brew install bash)\n' >&2
   exit 1
 fi
 
 set -uo pipefail
 
-readonly VERSION=0.2.0
+readonly VERSION=0.2.1
 readonly PROG=${0##*/}
 readonly DEFAULT_PORTS='21,22,23,25,53,80,110,111,135,139,143,389,443,445,587,993,995,1433,1521,2049,3306,3389,5432,5900,6379,8080,8443,9200,27017'
 readonly BANNER_MAX=200
-readonly MAX_PROBES=2000000
+readonly MAX_PROBES=${MAX_PROBES:-500000}
 
 declare -A SERVICE=(
   [21]=ftp [22]=ssh [23]=telnet [25]=smtp [53]=dns [80]=http [110]=pop3
@@ -29,6 +32,7 @@ declare -A SERVICE=(
   [2049]=nfs [3306]=mysql [3389]=rdp [5432]=postgres [5900]=vnc [6379]=redis
   [8080]=http-alt [8443]=https-alt [9200]=elasticsearch [27017]=mongodb
 )
+declare -A ETC_SERVICES=()
 
 HOST_SPEC=''
 PORT_SPEC=''
@@ -54,6 +58,7 @@ PORTS=()
 log()  { (( QUIET )) || printf '%s\n' "$*" >&2; }
 vlog() { (( VERBOSE )) && printf '%s\n' "$*" >&2; return 0; }
 die()  { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 2; }
+fail() { printf '%s: error: %s\n' "$PROG" "$*" >&2; exit 1; }
 
 usage() {
   cat <<HELP
@@ -153,16 +158,27 @@ expand_ports() {
   printf '%s\n' "${found[@]}" | sort -nu
 }
 
+# One pass over /etc/services, cached in memory. getent is glibc-only, so it is
+# useless on macOS; this reads the file directly instead of forking per port.
+load_etc_services() {
+  local name port proto _rest
+  [[ -r /etc/services ]] || return 0
+  while read -r name port proto _rest; do
+    [[ -n $name && -n $port ]] || continue
+    [[ $name == \#* ]] && continue
+    [[ $proto == tcp ]] || continue
+    port=${port%/tcp}
+    [[ $port =~ ^[0-9]+$ ]] || continue
+    [[ -n ${SERVICE[$port]:-} || -n ${ETC_SERVICES[$port]:-} ]] && continue
+    ETC_SERVICES[$port]=$name
+  done < /etc/services
+}
+
 service_for() {
-  local port=$1 name=''
-  if [[ -n ${SERVICE[$port]:-} ]]; then
-    printf '%s' "${SERVICE[$port]}"
-    return 0
-  fi
-  if command -v getent >/dev/null 2>&1; then
-    name=$(getent services "$port/tcp" 2>/dev/null | awk 'NR==1{print $1}')
-  fi
-  printf '%s' "${name:-unknown}"
+  local port=$1
+  if [[ -n ${SERVICE[$port]:-} ]]; then printf '%s' "${SERVICE[$port]}"; return 0; fi
+  if [[ -n ${ETC_SERVICES[$port]:-} ]]; then printf '%s' "${ETC_SERVICES[$port]}"; return 0; fi
+  printf 'unknown'
 }
 
 # Protocol-appropriate probe for well-known plaintext HTTP ports.
@@ -202,7 +218,7 @@ csv_field() {
 
 # ---------------------------------------------------------------- scanning
 # Probes one host:port and writes a TSV record (host, port, state, service, banner)
-# to $TMP_SCAN/r.<idx>. Open ports are always recorded; closed and filtered ports only with -a.
+# to $TMP_SCAN/r.<idx>. Open ports are always recorded; closed and filtered only with -a.
 scan_one() {
   local host=$1 port=$2 idx=$3
   local out state=closed rc=0 attempt probe banner='' svc
@@ -211,11 +227,9 @@ scan_one() {
   for (( attempt = 0; attempt <= RETRIES; attempt++ )); do
     rc=0
     "$TIMEOUT_BIN" "$TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null || rc=$?
-    case $rc in
-      0)   state=open; break ;;
-      124) state=filtered ;;
-      *)   state=closed ;;
-    esac
+    if (( rc == 0 )); then state=open; break; fi
+    # Only timeouts are worth retrying; a refusal is a definitive answer.
+    if (( rc == 124 )); then state=filtered; else state=closed; break; fi
   done
 
   if [[ $state == open ]]; then
@@ -242,8 +256,8 @@ dispatch() {
       while (( running >= MAXJOBS )); do
         rc=0
         wait -n 2>/dev/null || rc=$?
-        # 127 means no children were left to reap, so the count is already correct.
-        if (( rc == 127 )); then running=0; else running=$((running - 1)); fi
+        # Clamp rather than reset: a spurious 127 must not desync the counter.
+        (( running > 0 )) && running=$((running - 1))
       done
       scan_one "$host" "$port" "$idx" &
       running=$((running + 1))
@@ -260,7 +274,7 @@ collect() {
   local i f
   for ((i = 0; i < TOTAL_QUEUED; i++)); do
     f=$TMP_SCAN/r.$i
-    [[ -f $f ]] && cat -- "$f"
+    [[ -f $f ]] && cat "$f"
   done
   return 0
 }
@@ -329,9 +343,10 @@ parse_args() {
       --help) usage; exit 0 ;;
       --)
         shift
-        (( $# == 1 )) || die 'expected exactly one target after --'
-        [[ -z $HOST_SPEC ]] || die 'target specified twice'
-        HOST_SPEC=$1; shift
+        while (( $# )); do
+          [[ -z $HOST_SPEC ]] || die "unexpected argument: $1"
+          HOST_SPEC=$1; shift
+        done
         ;;
       -?*) die "unknown option: $1" ;;
       *)
@@ -343,7 +358,8 @@ parse_args() {
 
   [[ -n $HOST_SPEC ]] || { usage >&2; die 'target required (-h)'; }
   [[ $TIMEOUT =~ ^[1-9][0-9]{0,2}$ ]] || die 'timeout must be 1-999 seconds'
-  [[ $MAXJOBS =~ ^[1-9][0-9]{0,2}$ ]] && (( MAXJOBS <= 512 )) || die 'concurrency must be 1-512'
+  [[ $MAXJOBS =~ ^[1-9][0-9]{0,3}$ ]] || die 'concurrency must be 1-512'
+  (( MAXJOBS <= 512 )) || die 'concurrency must be 1-512'
   [[ $RETRIES =~ ^[0-9]$ ]] || die 'retries must be 0-9'
   case $FORMAT in
     text|json|csv) ;;
@@ -356,9 +372,9 @@ check_deps() {
   for c in timeout gtimeout; do
     if command -v "$c" >/dev/null 2>&1; then TIMEOUT_BIN=$c; break; fi
   done
-  [[ -n $TIMEOUT_BIN ]] || die 'GNU timeout required (macOS: brew install coreutils)'
+  [[ -n $TIMEOUT_BIN ]] || fail 'GNU timeout required (macOS: brew install coreutils)'
   for tool in sort tr head mktemp awk; do
-    command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
+    command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
   done
 }
 
@@ -378,8 +394,9 @@ main() {
   parse_args "$@"
   check_deps
   (( PORT_GIVEN )) || PORT_SPEC=$DEFAULT_PORTS
+  load_etc_services
 
-  TMP_SCAN=$(mktemp -d) || die 'cannot create temporary directory'
+  TMP_SCAN=$(mktemp -d) || fail 'cannot create temporary directory'
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -388,15 +405,15 @@ main() {
   expand_ports "$PORT_SPEC" > "$TMP_SCAN/ports"
   mapfile -t HOSTS < "$TMP_SCAN/hosts"
   mapfile -t PORTS < "$TMP_SCAN/ports"
-  (( ${#HOSTS[@]} > 0 && ${#PORTS[@]} > 0 )) || die 'empty host or port list'
+  (( ${#HOSTS[@]} > 0 && ${#PORTS[@]} > 0 )) || fail 'empty host or port list'
 
   total=$(( ${#HOSTS[@]} * ${#PORTS[@]} ))
-  (( total <= MAX_PROBES )) || die "$total probes exceeds the limit of $MAX_PROBES; narrow the target or ports"
+  (( total <= MAX_PROBES )) || fail "$total probes exceeds the limit of $MAX_PROBES; narrow the target or ports"
 
   if [[ -n $OUTFILE ]]; then
     if [[ $OUTFILE == */* ]]; then dir=${OUTFILE%/*}; else dir=.; fi
-    [[ -d $dir ]] || die "no such directory: $dir"
-    : > "$OUTFILE" 2>/dev/null || die "cannot write output: $OUTFILE"
+    [[ -d $dir ]] || fail "no such directory: $dir"
+    : > "$OUTFILE" 2>/dev/null || fail "cannot write output: $OUTFILE"
   fi
 
   log "$PROG $VERSION: ${#HOSTS[@]} host(s) x ${#PORTS[@]} port(s), timeout ${TIMEOUT}s, retries $RETRIES, jobs $MAXJOBS"
@@ -407,7 +424,7 @@ main() {
   collect > "$TMP_SCAN/all.tsv"
 
   if [[ -n $OUTFILE ]]; then
-    emit < "$TMP_SCAN/all.tsv" | tee -- "$OUTFILE" || die "failed writing results to $OUTFILE"
+    emit < "$TMP_SCAN/all.tsv" | tee "$OUTFILE" || fail "failed writing results to $OUTFILE"
   else
     emit < "$TMP_SCAN/all.tsv"
   fi
