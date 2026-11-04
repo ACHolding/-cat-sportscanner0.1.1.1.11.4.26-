@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# cats-portscan 0.2.2 - TCP connect scanner
+# cat's port scanner 0.1.1.1 - TCP connect scanner
 #
 # Scan only systems you own or have explicit written authorization to test.
 #
@@ -19,7 +19,7 @@ fi
 
 set -uo pipefail
 
-readonly VERSION=0.2.2
+readonly VERSION=0.1.1.1
 readonly PROG=${0##*/}
 readonly DEFAULT_PORTS='21,22,23,25,53,80,110,111,135,139,143,389,443,445,587,993,995,1433,1521,2049,3306,3389,5432,5900,6379,8080,8443,9200,27017'
 readonly BANNER_MAX=200
@@ -194,7 +194,7 @@ default_probe() {
 # The probe is passed as a positional argument, so it never reaches the shell parser.
 grab_banner() {
   local host=$1 port=$2 probe=$3
-  "$TIMEOUT_BIN" "$TIMEOUT" bash -c '
+  "$TIMEOUT_BIN" "$TIMEOUT" "$BASH" -c '
     exec 3<>/dev/tcp/"$1"/"$2" || exit 1
     if [[ -n $3 ]]; then printf "%b" "$3" >&3; fi
     IFS= read -r -t "$4" line <&3 || true
@@ -227,7 +227,7 @@ scan_one() {
 
   for (( attempt = 0; attempt <= RETRIES; attempt++ )); do
     rc=0
-    "$TIMEOUT_BIN" "$TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null || rc=$?
+    "$TIMEOUT_BIN" "$TIMEOUT" "$BASH" -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" 2>/dev/null || rc=$?
     if (( rc == 0 )); then state=open; break; fi
     # Only timeouts are worth retrying; a refusal is a definitive answer.
     if (( rc == 124 )); then state=filtered; else state=closed; break; fi
